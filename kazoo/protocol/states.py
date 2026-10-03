@@ -76,6 +76,45 @@ class KeeperState(str, Enum):
     EXPIRED_SESSION = "EXPIRED_SESSION"
 
 
+class WatcherType(int, Enum):
+    """ZooKeeper watcher types.
+
+    The non-negative values mirror the watch kinds used by the classic
+    one-shot watches. The negative values identify the persistent
+    watchers added in ZooKeeper 3.6 (opcode ``addWatch``).
+
+    .. attribute:: CHILDREN
+
+        One-shot watch left by a ``get_children`` call.
+
+    .. attribute:: DATA
+
+        One-shot watch left by an ``exists`` or ``get`` call.
+
+    .. attribute:: ANY
+
+        One-shot watch covering both data and children events.
+
+    .. attribute:: PERSISTENT
+
+        Persistent watch that stays registered after triggering and is
+        only removed explicitly.
+
+    .. attribute:: PERSISTENT_RECURSIVE
+
+        Persistent watch that additionally covers events on any
+        descendant path. Matching is done by path segment, so a watch on
+        ``/app`` does not match an event on ``/apple``.
+
+    """
+
+    CHILDREN = 1
+    DATA = 2
+    ANY = 3
+    PERSISTENT = -1
+    PERSISTENT_RECURSIVE = -2
+
+
 # This is a (str, Enum) for backwards compatibility.
 class EventType(str, Enum):
     """Zookeeper Event

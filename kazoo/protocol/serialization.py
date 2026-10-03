@@ -505,6 +505,56 @@ class Reconfig(
         return data, stat
 
 
+class RemoveWatches(namedtuple("RemoveWatches", "path watcher_type")):
+    """Request to remove a watch from the server (opcode 18).
+
+    Only used for persistent/persistent-recursive watches. One-shot
+    watches are removed automatically once triggered and don't issue this
+    request.
+    """
+
+    path: str
+    watcher_type: int
+
+    type: ClassVar[int] = 18
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(int_struct.pack(self.watcher_type))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes: bytes, offset: int) -> bool:
+        # Empty response body
+        return True
+
+
+class AddWatch(namedtuple("AddWatch", "path watcher_type")):
+    """Request to register a persistent watch (opcode 106).
+
+    Requires ZooKeeper 3.6+. ``watcher_type`` is one of
+    :data:`~kazoo.protocol.states.WatcherType.PERSISTENT` or
+    :data:`~kazoo.protocol.states.WatcherType.PERSISTENT_RECURSIVE`.
+    """
+
+    path: str
+    watcher_type: int
+
+    type: ClassVar[int] = 106
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(int_struct.pack(self.watcher_type))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes: bytes, offset: int) -> bool:
+        # Empty response body
+        return True
+
+
 class Auth(namedtuple("Auth", "auth_type scheme auth")):
     auth_type: int
     scheme: str

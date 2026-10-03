@@ -43,6 +43,7 @@ from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.connection import ConnectionHandler
 from kazoo.protocol.paths import _prefix_root, normpath
 from kazoo.protocol.serialization import (
+    AddWatch,
     Auth,
     CheckVersion,
     CloseInstance,
@@ -56,6 +57,7 @@ from kazoo.protocol.serialization import (
     SetACL,
     GetData,
     Reconfig,
+    RemoveWatches,
     SetData,
     Sync,
     Transaction,
@@ -66,6 +68,7 @@ from kazoo.protocol.states import (
     KazooState,
     KeeperState,
     WatchedEvent,
+    WatcherType,
 )
 from kazoo.retry import KazooRetry
 from kazoo.security import ACL, OPEN_ACL_UNSAFE
@@ -375,6 +378,14 @@ class KazooClient:
         self._data_watchers: defaultdict[str, Set[WatchFunc]] = defaultdict(
             set
         )
+        # Persistent and persistent-recursive watches keyed by the
+        # chrooted path. The value maps each registered callback to its
+        # WatcherType. Unlike the one-shot watcher sets above, this dict
+        # survives connection drops and session expiration because these
+        # watches are re-registered by the client.
+        self._persistent_watchers: dict[
+            str, dict[WatchFunc, WatcherType]
+        ] = {}
         self._reset()
         self.read_only = read_only
 
@@ -573,6 +584,127 @@ class KazooClient:
         ev = WatchedEvent(EventType.NONE, self._state, None)
         for watch in watchers:
             self.handler.dispatch_callback(Callback("watch", watch, (ev,)))
+
+    def _add_persistent_watch_local(
+        self,
+        path: str,
+        watch: WatchFunc,
+        watcher_type: WatcherType,
+    ) -> None:
+        """Record a persistent watch in local state.
+
+        A single callback may be registered on more than one path (e.g. a
+        persistent watch on ``/a`` and a persistent-recursive watch on
+        ``/``). Per path the callback keeps the mode it was first
+        registered with; re-registering the same callback with a
+        different mode is rejected so that fan-out semantics stay
+        deterministic.
+        """
+        existing = self._persistent_watchers.get(path)
+        if existing is None:
+            self._persistent_watchers[path] = {watch: watcher_type}
+            return
+        previous = existing.get(watch)
+        if previous is not None and previous != watcher_type:
+            raise ValueError(
+                "Callback is already registered on %s with watcher type "
+                "%s, cannot re-register it as %s"
+                % (path, previous.name, watcher_type.name)
+            )
+        existing[watch] = watcher_type
+
+    def _remove_persistent_watch_local(
+        self,
+        path: str,
+        watch: WatchFunc,
+    ) -> WatcherType | None:
+        """Remove a persistent watch callback from local state.
+
+        Returns the server-side :class:`WatcherType` that must be torn
+        down with a RemoveWatches request, or ``None`` if the callback
+        wasn't registered / its mode is still needed by another callback
+        on the same path.
+        """
+        existing = self._persistent_watchers.get(path)
+        if not existing or watch not in existing:
+            return None
+        watcher_type = existing.pop(watch)
+        if not existing:
+            del self._persistent_watchers[path]
+            return watcher_type
+        # Other callbacks remain on this path. The server-side watch of
+        # the removed mode only needs tearing down if no remaining
+        # callback uses it.
+        if watcher_type not in set(existing.values()):
+            return watcher_type
+        return None
+
+    @staticmethod
+    def _persistent_path_matches(
+        watch_path: str,
+        event_path: str,
+        watcher_type: WatcherType,
+    ) -> bool:
+        """Whether a persistent watch on ``watch_path`` covers
+        ``event_path``.
+
+        Recursive matching is strictly by path segment so that a watch
+        on ``/app`` does not match an event on ``/apple``.
+        """
+        if watcher_type == WatcherType.PERSISTENT:
+            return event_path == watch_path
+        if watcher_type == WatcherType.PERSISTENT_RECURSIVE:
+            if watch_path == "/":
+                return True
+            return event_path == watch_path or event_path.startswith(
+                watch_path + "/"
+            )
+        return False
+
+    def _persistent_watches_for_event(
+        self, event_path: str
+    ) -> list[tuple[WatchFunc, str]]:
+        """Collect callbacks for an event path with deterministic
+        ordering and at most one invocation per callback.
+
+        Paths are visited in lexicographic order and within a path the
+        callbacks visit in registration order. A callback reachable from
+        several registrations (e.g. an exact and a recursive watch) is
+        therefore invoked exactly once, for the lexicographically first
+        matching registration path.
+        """
+        seen: set[int] = set()
+        result: list[tuple[WatchFunc, str]] = []
+        for watch_path in sorted(self._persistent_watchers):
+            for callback, watcher_type in self._persistent_watchers[
+                watch_path
+            ].items():
+                if id(callback) in seen:
+                    continue
+                if self._persistent_path_matches(
+                    watch_path, event_path, watcher_type
+                ):
+                    seen.add(id(callback))
+                    result.append((callback, watch_path))
+        return result
+
+    def _persistent_watches_to_reregister(self) -> list[AddWatch]:
+        """Snapshot of the AddWatch requests needed to reinstall all
+        locally known persistent watches, one per (path, mode) pair."""
+        requests: list[AddWatch] = []
+        for watch_path in sorted(self._persistent_watchers):
+            modes = sorted(
+                {
+                    watcher_type
+                    for watcher_type in self._persistent_watchers[
+                        watch_path
+                    ].values()
+                },
+                key=lambda watcher_type: watcher_type.value,
+            )
+            for watcher_type in modes:
+                requests.append(AddWatch(watch_path, watcher_type.value))
+        return requests
 
     def _reset_session(self) -> None:
         self._session_id = None
@@ -1494,6 +1626,164 @@ class KazooClient:
         self._call(
             GetData(_prefix_root(self.chroot, path), watch), async_result
         )
+        return async_result
+
+    def add_watch(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: WatcherType = WatcherType.PERSISTENT_RECURSIVE,
+    ) -> bool:
+        """Register a persistent watch on a path.
+
+        Unlike the one-shot watches passed to :meth:`exists`,
+        :meth:`get` and :meth:`get_children`, persistent watches are not
+        consumed when triggered. They stay registered until removed
+        explicitly with :meth:`remove_watch`, and survive connection
+        drops.
+
+        The watch receives data and child events for the watched node
+        and, when registered with
+        :attr:`~kazoo.protocol.states.WatcherType.PERSISTENT_RECURSIVE`,
+        for every node beneath it. Recursive matching is performed by
+        path segment, so a watch registered on ``/app`` never matches an
+        event on ``/apple``.
+
+        If the same callback is registered on a path more than once it
+        is stored only once and called at most once per event. A
+        callback reachable from several of its own registrations for a
+        single event (e.g. an exact watch on ``/a`` and a recursive
+        watch on ``/``) is likewise invoked exactly once.
+
+        Registration succeeds even while the connection is
+        ``SUSPENDED``; the watch is recorded locally and sent to the
+        server before any other request once the connection is back.
+        After a true session loss the client transparently re-registers
+        every locally known persistent watch on the new session.
+
+        Requires ZooKeeper 3.6 or newer.
+
+        :param path: Path of node to watch.
+        :param watch: Watch callback called with a
+            :class:`~kazoo.protocol.states.WatchedEvent`.
+        :param mode: One of
+            :attr:`~kazoo.protocol.states.WatcherType.PERSISTENT` or
+            :attr:`~kazoo.protocol.states.WatcherType.PERSISTENT_RECURSIVE`
+            (the default).
+        :returns: ``True`` when the registration is established.
+        :raises:
+            :exc:`TypeError` if ``path`` isn't a string or ``watch``
+            isn't callable.
+
+            :exc:`ValueError` if ``mode`` isn't a persistent watcher
+            type, or the callback is already registered on ``path``
+            with a different mode.
+
+        .. versionadded:: 2.12
+        """
+        return cast("bool", self.add_watch_async(path, watch, mode).get())
+
+    def add_watch_async(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: WatcherType = WatcherType.PERSISTENT_RECURSIVE,
+    ) -> IAsyncResult:
+        """Asynchronously register a persistent watch. Takes the same
+        arguments as :meth:`add_watch`.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+
+        .. versionadded:: 2.12
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        if not callable(watch):
+            raise TypeError("Invalid type for 'watch' (must be a callable)")
+        if mode not in (
+            WatcherType.PERSISTENT,
+            WatcherType.PERSISTENT_RECURSIVE,
+        ):
+            raise ValueError(
+                "Persistent watch mode must be WatcherType.PERSISTENT or "
+                "WatcherType.PERSISTENT_RECURSIVE"
+            )
+
+        full_path = _prefix_root(self.chroot, path)
+        self._add_persistent_watch_local(full_path, watch, mode)
+
+        async_result = self.handler.async_result()
+        if not self._live.is_set():
+            # Disconnected (SUSPENDED) or never started: the watch is
+            # tracked locally and gets installed (or re-installed on a
+            # new session) by the connection layer.
+            async_result.set(True)
+        else:
+            self._call(AddWatch(full_path, mode.value), async_result)
+        return async_result
+
+    def remove_watch(
+        self,
+        path: str,
+        watch: WatchFunc,
+    ) -> bool:
+        """Remove a persistent watch previously added with
+        :meth:`add_watch`.
+
+        The watch is removed from local state immediately, so it can
+        never be brought back by an in-flight reconnect or by
+        re-registration after a session loss. When the connection is
+        currently down (``SUSPENDED``) no server request is sent; the
+        client simply stops tracking the watch, which is sufficient
+        because reconnect only reinstalls watches still present locally.
+
+        :param path: Path the watch was registered on.
+        :param watch: The callback to remove.
+        :returns: ``True`` if the callback was registered and has been
+            removed, ``False`` if it wasn't found.
+        :raises:
+            :exc:`TypeError` if ``path`` isn't a string or ``watch``
+            isn't callable.
+
+            :exc:`~kazoo.exceptions.NoWatcherError` if the server has
+            no matching watch (only raised when connected).
+
+        .. versionadded:: 2.12
+        """
+        return cast("bool", self.remove_watch_async(path, watch).get())
+
+    def remove_watch_async(
+        self,
+        path: str,
+        watch: WatchFunc,
+    ) -> IAsyncResult:
+        """Asynchronously remove a persistent watch. Takes the same
+        arguments as :meth:`remove_watch`.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+
+        .. versionadded:: 2.12
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        if not callable(watch):
+            raise TypeError("Invalid type for 'watch' (must be a callable)")
+
+        full_path = _prefix_root(self.chroot, path)
+        watcher_type = self._remove_persistent_watch_local(full_path, watch)
+
+        async_result = self.handler.async_result()
+        if watcher_type is None:
+            async_result.set(False)
+        elif not self._live.is_set():
+            # Local removal while disconnected is authoritative; do not
+            # resurrect the watch when the reconnect runs.
+            async_result.set(True)
+        else:
+            self._call(
+                RemoveWatches(full_path, watcher_type.value),
+                async_result,
+            )
         return async_result
 
     @overload

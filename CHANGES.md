@@ -1,6 +1,18 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Features
+
+* **client:**
+  * add persistent and persistent-recursive watches via
+    `KazooClient.add_watch()` / `add_watch_async()` and
+    `remove_watch()` / `remove_watch_async()`, backed by the ZooKeeper
+    `addWatch` (opcode 106) and `removeWatches` (opcode 18) requests.
+    Persistent watches are not consumed by events, survive transient
+    connection drops and session loss (re-registered automatically on
+    the new session), and recursive matching is done by path segment
+    (`/app` does not match `/apple`). Requires ZooKeeper 3.6+.
+
 #### Bug Fixes
 
 * **protocol:**

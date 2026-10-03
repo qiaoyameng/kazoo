@@ -441,6 +441,51 @@ class TestReconfig(unittest.TestCase):
         assert stat == _make_stat()
 
 
+class TestRemoveWatches(unittest.TestCase):
+    def test_type(self) -> None:
+        assert serialization.RemoveWatches.type == 18
+
+    def test_serialize(self) -> None:
+        # Fixed protocol bytes: path string then watcher type int.
+        obj = serialization.RemoveWatches("/app", -1)
+        assert bytes(obj.serialize()) == (
+            _write_string("/app") + _int_struct.pack(-1)
+        )
+
+    def test_serialize_recursive(self) -> None:
+        obj = serialization.RemoveWatches("/app", -2)
+        assert bytes(obj.serialize()) == (
+            _write_string("/app") + _int_struct.pack(-2)
+        )
+
+    def test_deserialize(self) -> None:
+        # Empty reply body
+        assert serialization.RemoveWatches.deserialize(b"", 0) is True
+
+
+class TestAddWatch(unittest.TestCase):
+    def test_type(self) -> None:
+        assert serialization.AddWatch.type == 106
+
+    def test_serialize_persistent(self) -> None:
+        # Fixed protocol bytes for a persistent watcher (-1).
+        obj = serialization.AddWatch("/app", -1)
+        assert bytes(obj.serialize()) == (
+            _write_string("/app") + _int_struct.pack(-1)
+        )
+
+    def test_serialize_persistent_recursive(self) -> None:
+        # Fixed protocol byte sequence for recursive watcher (-2):
+        # len("/app")=4 -> 00 00 00 04, "/app", ff ff ff fe
+        obj = serialization.AddWatch("/app", -2)
+        assert bytes(obj.serialize()) == (
+            b"\x00\x00\x00\x04/app\xff\xff\xff\xfe"
+        )
+
+    def test_deserialize(self) -> None:
+        assert serialization.AddWatch.deserialize(b"", 0) is True
+
+
 class TestAuth(unittest.TestCase):
     def test_type(self) -> None:
         assert serialization.Auth.type == 100

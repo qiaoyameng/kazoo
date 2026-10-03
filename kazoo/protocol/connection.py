@@ -465,6 +465,16 @@ class ConnectionHandler:
             self.logger.warn("Received unknown event %r", watch.type)
             return
 
+        # Persistent watches are not consumed by an event; collect their
+        # callbacks without removing the registrations. Exact and
+        # recursive matching plus per-event de-duplication live in the
+        # client. One-shot watchers take precedence: a callback present
+        # in both lists is only dispatched once.
+        persistent_matches = client._persistent_watches_for_event(path)
+        dispatched = set()
+        for watch1 in watchers:
+            dispatched.add(id(watch1))
+
         # Strip the chroot if needed
         path = client.unchroot(path)
         ev = WatchedEvent(EVENT_TYPE_MAP[watch.type], client._state, path)
@@ -475,6 +485,11 @@ class ConnectionHandler:
 
         # Dump the watchers to the watch thread
         for watch1 in watchers:
+            client.handler.dispatch_callback(Callback("watch", watch1, (ev,)))
+        for watch1, _watch_path in persistent_matches:
+            if id(watch1) in dispatched:
+                continue
+            dispatched.add(id(watch1))
             client.handler.dispatch_callback(Callback("watch", watch1, (ev,)))
 
     def _read_response(
@@ -925,7 +940,52 @@ class ConnectionHandler:
             if zxid:
                 client.last_zxid = zxid
 
+        # Re-establish persistent watches before any other request is
+        # sent on this (possibly new) connection/session. One-shot
+        # watches are managed by the application through the state
+        # listener, whereas persistent watches are owned by the client
+        # and must survive transient drops and real session losses.
+        #
+        # Ordering matters: the AddWatch requests are put at the front
+        # of the request queue, so they are written before requests that
+        # were queued while disconnected. The snapshot is taken here, so
+        # a watch removed during the reconnect window is no longer in
+        # local state and is not brought back.
+        self._prime_persistent_watches()
+
         return read_timeout, connect_timeout
+
+    def _prime_persistent_watches(self) -> None:
+        client = self.client
+        requests = client._persistent_watches_to_reregister()
+        if not requests:
+            return
+        async_results = [client.handler.async_result() for _ in requests]
+
+        def _check() -> None:
+            for result in async_results:
+                try:
+                    result.get()
+                except Exception:
+                    # The watch will be retried by the user or surface on
+                    # the next reconnect; a failed re-registration must
+                    # not kill the connection loop.
+                    self.logger.warning(
+                        "Failed to re-register persistent watch",
+                        exc_info=True,
+                    )
+
+        # deque.appendleft puts items at the head; appending in reverse
+        # order therefore preserves the snapshot order, and all AddWatch
+        # requests precede anything already queued.
+        for request, result in reversed(list(zip(requests, async_results))):
+            client._queue.appendleft((request, result))
+            result.rawlink(lambda _result, check=_check: check())
+        if self._write_sock is not None:
+            try:
+                self._write_sock.send(b"\0")
+            except OSError:
+                pass
 
     def _authenticate_with_sasl(self, host: str, timeout: float) -> None:
         """Establish a SASL authenticated connection to the server."""
