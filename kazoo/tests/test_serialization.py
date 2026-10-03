@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 import unittest
 
-from kazoo.exceptions import ZookeeperError
+from kazoo.exceptions import MarshallingError, NoNodeError, ZookeeperError
 from kazoo.protocol import serialization
 from kazoo.protocol.states import ZnodeStat
 from kazoo.security import ACL, Id
@@ -390,6 +390,164 @@ class TestTransaction(unittest.TestCase):
             response,  # type: ignore[arg-type]
         )
         assert result == ["/b", True, "/c"]
+
+
+class TestMultiRead(unittest.TestCase):
+    def test_type(self) -> None:
+        assert serialization.MultiRead.type == 22
+
+    def test_serialize_empty(self) -> None:
+        multi_read = serialization.MultiRead([])
+        assert multi_read.serialize() == _multiheader_struct.pack(-1, 1, -1)
+
+    def test_serialize_operations_and_terminator(self) -> None:
+        multi_read = serialization.MultiRead(
+            [
+                serialization.GetData("/a", None),
+                serialization.GetChildren("/b", None),
+            ]
+        )
+        expected = (
+            _multiheader_struct.pack(
+                serialization.GetData.type, 0, -1
+            )
+            + _write_string("/a")
+            + b"\x00"
+            + _multiheader_struct.pack(
+                serialization.GetChildren.type, 0, -1
+            )
+            + _write_string("/b")
+            + b"\x00"
+            + _multiheader_struct.pack(-1, 1, -1)
+        )
+        assert multi_read.serialize() == expected
+
+    def test_serialize_uses_multiread_opcodes_not_transaction(self) -> None:
+        multi_read = serialization.MultiRead(
+            [serialization.GetData("/a", None)]
+        )
+        serialized = multi_read.serialize()
+        # The first MultiHeader carries the getData opcode (4); the
+        # terminating header has type -1 and done=1.
+        assert serialized.startswith(_multiheader_struct.pack(4, 0, -1))
+        assert serialized.endswith(_multiheader_struct.pack(-1, 1, -1))
+
+    def test_deserialize_empty(self) -> None:
+        multi_read = serialization.MultiRead([])
+        result = multi_read.deserialize(
+            _multiheader_struct.pack(-1, 1, -1), 0
+        )
+        assert result == []
+
+    def test_deserialize_mixed_success_and_failure_keeps_order(self) -> None:
+        multi_read = serialization.MultiRead(
+            [
+                serialization.GetData("/a", None),
+                serialization.GetData("/missing", None),
+                serialization.GetChildren("/b", None),
+            ]
+        )
+        response = (
+            _multiheader_struct.pack(serialization.GetData.type, 0, -1)
+            + _write_buffer(b"data")
+            + _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+            + _multiheader_struct.pack(-1, 0, NoNodeError.code)
+            + _int_struct.pack(NoNodeError.code)
+            + _multiheader_struct.pack(
+                serialization.GetChildren.type, 0, -1
+            )
+            + _int_struct.pack(2)
+            + _write_string("c1")
+            + _write_string("c2")
+            + _multiheader_struct.pack(-1, 1, -1)
+        )
+        result = multi_read.deserialize(response, 0)
+        assert len(result) == 3
+        assert result[0] == (b"data", _make_stat())
+        assert isinstance(result[1], NoNodeError)
+        # The failure stays in its slot instead of shifting later
+        # results forward.
+        assert result[2] == ["c1", "c2"]
+
+    def test_deserialize_two_failures_preserve_positions(self) -> None:
+        multi_read = serialization.MultiRead(
+            [
+                serialization.GetChildren("/missing1", None),
+                serialization.GetData("/missing2", None),
+            ]
+        )
+        response = (
+            _multiheader_struct.pack(-1, 0, NoNodeError.code)
+            + _int_struct.pack(NoNodeError.code)
+            + _multiheader_struct.pack(-1, 0, NoNodeError.code)
+            + _int_struct.pack(NoNodeError.code)
+            + _multiheader_struct.pack(-1, 1, -1)
+        )
+        result = multi_read.deserialize(response, 0)
+        assert len(result) == 2
+        assert isinstance(result[0], NoNodeError)
+        assert isinstance(result[1], NoNodeError)
+
+    def test_deserialize_truncated_response_raises(self) -> None:
+        multi_read = serialization.MultiRead(
+            [
+                serialization.GetData("/a", None),
+                serialization.GetChildren("/b", None),
+            ]
+        )
+        response = (
+            _multiheader_struct.pack(serialization.GetData.type, 0, -1)
+            + _write_buffer(b"data")
+            + _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+            # The promised second result plus terminator are missing.
+        )
+        with self.assertRaises(struct.error):
+            multi_read.deserialize(response, 0)
+
+    def test_deserialize_unknown_operation_type_raises(self) -> None:
+        multi_read = serialization.MultiRead(
+            [serialization.GetData("/a", None)]
+        )
+        response = (
+            _multiheader_struct.pack(serialization.Sync.type, 0, -1)
+            + _write_string("/a")
+            + _multiheader_struct.pack(-1, 1, -1)
+        )
+        with self.assertRaises(MarshallingError):
+            multi_read.deserialize(response, 0)
+
+    def test_deserialize_count_mismatch_raises(self) -> None:
+        multi_read = serialization.MultiRead(
+            [
+                serialization.GetData("/a", None),
+                serialization.GetChildren("/b", None),
+            ]
+        )
+        # Server returned fewer results than requests.
+        too_few = (
+            _multiheader_struct.pack(serialization.GetData.type, 0, -1)
+            + _write_buffer(b"data")
+            + _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+            + _multiheader_struct.pack(-1, 1, -1)
+        )
+        with self.assertRaises(MarshallingError):
+            multi_read.deserialize(too_few, 0)
+
+        # Server returned more results than requests.
+        too_many = (
+            _multiheader_struct.pack(serialization.GetData.type, 0, -1)
+            + _write_buffer(b"d1")
+            + _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+            + _multiheader_struct.pack(serialization.GetData.type, 0, -1)
+            + _write_buffer(b"d2")
+            + _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+            + _multiheader_struct.pack(serialization.GetData.type, 0, -1)
+            + _write_buffer(b"d3")
+            + _stat_struct.pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+            + _multiheader_struct.pack(-1, 1, -1)
+        )
+        with self.assertRaises(MarshallingError):
+            multi_read.deserialize(too_many, 0)
 
 
 class TestCreate2(unittest.TestCase):

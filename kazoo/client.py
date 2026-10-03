@@ -55,6 +55,7 @@ from kazoo.protocol.serialization import (
     GetACL,
     SetACL,
     GetData,
+    MultiRead,
     Reconfig,
     SetData,
     Sync,
@@ -86,6 +87,9 @@ if TYPE_CHECKING:
     from kazoo.interfaces import Event, IAsyncResult, IHandler
     from kazoo.protocol.states import ZnodeStat
     from kazoo.handlers.gevent import SequentialGeventHandler
+
+    # A read in a multiRead batch: ("data"|"children", path).
+    MultiReadOperation = tuple[str, str]
 
 
 CLOSED_STATES = (
@@ -1758,6 +1762,81 @@ class KazooClient:
         """
         return TransactionRequest(self)
 
+    def multi_read(
+        self,
+        operations: Sequence[MultiReadOperation] | None = None,
+    ) -> list[Any] | MultiReadRequest:
+        """Batch several getData/getChildren reads into a single request.
+
+        Each operation is a ``(kind, path)`` tuple where *kind* is either
+        ``"data"`` (a :meth:`get` read) or ``"children"`` (a
+        :meth:`get_children` read). The returned list is in the same
+        order as *operations*:
+
+        * ``"data"`` results are ``(data, stat)`` tuples.
+        * ``"children"`` results are lists of child names.
+        * A read that fails (e.g. the path doesn't exist) returns the
+          corresponding exception object at that position instead of a
+          value, so later results are never shifted.
+
+        This is a read-only batch, **not** an atomic transaction: the
+        reads are served in order but may observe different points in
+        time; no consistent snapshot is guaranteed.
+
+        With no *operations* argument a :class:`MultiReadRequest`
+        builder is returned instead.
+
+        :param operations: An optional sequence of
+                           ``(kind, path)`` tuples.
+        :returns: The per-operation results, or a
+                  :class:`MultiReadRequest` builder.
+        :raises:
+            :exc:`~kazoo.exceptions.UnimplementedApiError` if the server
+            doesn't support multiRead (Zookeeper older than 3.6).
+
+        .. versionadded:: 2.12
+            Requires Zookeeper 3.6+
+
+        """
+        if operations is None:
+            return MultiReadRequest(self)
+        return self.multi_read_async(operations).get()
+
+    def multi_read_async(
+        self, operations: Sequence[MultiReadOperation]
+    ) -> IAsyncResult:
+        """Asynchronously batch several getData/getChildren reads.
+
+        Takes the same arguments as :meth:`multi_read` (without the
+        builder short form). The result order and per-item errors
+        follow the same rules as :meth:`multi_read`.
+
+        If the server doesn't implement multiRead (Zookeeper older than
+        3.6), the async result fails with
+        :exc:`~kazoo.exceptions.UnimplementedApiError` (code -117).
+        The batch is never transparently split into individual
+        requests.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+
+        """
+        builder = MultiReadRequest(self)
+        for operation in operations:
+            if not isinstance(operation, tuple) or len(operation) != 2:
+                raise TypeError(
+                    "Each operation must be a (kind, path) tuple"
+                )
+            kind, path = operation
+            if kind == "data":
+                builder.get_data(path)
+            elif kind == "children":
+                builder.get_children(path)
+            else:
+                raise ValueError(
+                    "Unknown multiRead operation kind: %r" % (kind,)
+                )
+        return builder.commit_async()
+
     # This should not return anything. No return value is documented, and the
     # two called functions return different things. AFAICT. But for now I
     # want to minimise code changes
@@ -2104,5 +2183,89 @@ class TransactionRequest:
         post_processor: Callable[[Any], Any] | None = None,
     ) -> None:
         self._check_tx_state()
+        self.client.logger.log(BLATHER, "Added %r to %r", request, self)
+        self.operations.append(request)
+
+
+class MultiReadRequest:
+    """A Zookeeper multiRead request
+
+    A builder object used to construct a single batch of getData and
+    getChildren reads which is sent to Zookeeper in one request. It
+    mirrors :class:`TransactionRequest` but is read-only.
+
+    The batch is not atomic. The reads are executed in order, but each
+    one may observe a different point in time; no consistent snapshot is
+    provided. An individual read that fails (for example because the
+    node doesn't exist) does not prevent the other reads from running,
+    and its error appears in the corresponding result position.
+
+    MultiReadRequest objects are not thread-safe and should not be
+    accessed from multiple threads at once.
+
+    .. versionadded:: 2.12
+        Requires Zookeeper 3.6+
+
+    """
+
+    def __init__(self, client: KazooClient):
+        self.client = client
+        self.operations: list[Any] = []
+        self.committed = False
+
+    def get_data(self, path: str) -> None:
+        """Add a getData read to the batch.
+
+        On success the corresponding result is a ``(data, stat)`` tuple,
+        the same as :meth:`KazooClient.get`. Watches are not supported
+        on multiRead sub-requests.
+
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        self._add(GetData(_prefix_root(self.client.chroot, path), None))
+
+    def get_children(self, path: str) -> None:
+        """Add a getChildren read to the batch.
+
+        On success the corresponding result is a list of child names,
+        the same as :meth:`KazooClient.get_children`. Watches are not
+        supported on multiRead sub-requests.
+
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        self._add(
+            GetChildren(_prefix_root(self.client.chroot, path), None)
+        )
+
+    def commit_async(self) -> IAsyncResult:
+        """Send the multiRead batch asynchronously.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+
+        """
+        self._check_state()
+        self.committed = True
+        async_object = self.client.handler.async_result()
+        self.client._call(MultiRead(self.operations), async_object)
+        return async_object
+
+    def commit(self) -> list[Any]:
+        """Send the multiRead batch and return its results.
+
+        :returns: A list with one entry per operation, in order. Each
+                  entry is the read result or, for a failed read, the
+                  exception object for that position.
+
+        """
+        return cast("list[Any]", self.commit_async().get())
+
+    def _check_state(self) -> None:
+        if self.committed:
+            raise ValueError("multiRead request already committed")
+
+    def _add(self, request: Any) -> None:
+        self._check_state()
         self.client.logger.log(BLATHER, "Added %r to %r", request, self)
         self.operations.append(request)

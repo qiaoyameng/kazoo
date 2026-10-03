@@ -12,7 +12,7 @@ import struct
 from collections import namedtuple
 from typing import ClassVar, Sequence, Union, TYPE_CHECKING
 
-from kazoo.exceptions import EXCEPTIONS, ZookeeperError
+from kazoo.exceptions import EXCEPTIONS, MarshallingError, ZookeeperError
 from kazoo.protocol.states import ZnodeStat
 from kazoo.security import ACL
 from kazoo.security import Id
@@ -447,6 +447,74 @@ class Transaction(namedtuple("Transaction", "operations")):
             else:
                 resp.append(result)
         return resp
+
+
+# Read operations supported by the multiRead request introduced in
+# Zookeeper 3.6.
+MultiRead_Types = Union[GetData, GetChildren]
+MultiRead_Response = Union[
+    tuple[bytes | None, ZnodeStat], list[str], ZookeeperError
+]
+
+
+class MultiRead(namedtuple("MultiRead", "operations")):
+    """A batch of GetData/GetChildren reads sent as a single request.
+
+    Unlike a write :class:`Transaction`, a multiRead is not atomic: the
+    server executes the reads in order, but they may observe different
+    points in time. Each per-read error (e.g. NoNode) is returned in the
+    corresponding result position rather than aborting the batch.
+    """
+
+    operations: list[MultiRead_Types]
+
+    type: ClassVar[int] = 22
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        for op in self.operations:
+            b.extend(
+                MultiHeader(op.type, False, -1).serialize() + op.serialize()
+            )
+        return b + multiheader_struct.pack(-1, True, -1)
+
+    def deserialize(
+        self, bytes: bytes, offset: int
+    ) -> list[MultiRead_Response]:
+        results: list[MultiRead_Response] = []
+        header, offset = MultiHeader.deserialize(bytes, offset)
+        while not header.done:
+            if header.type == GetData.type:
+                data, offset = read_buffer(bytes, offset)
+                stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
+                offset += stat_struct.size
+                response = (data, stat)
+            elif header.type == GetChildren.type:
+                count = int_struct.unpack_from(bytes, offset)[0]
+                offset += int_struct.size
+                children: list[str] = []
+                if count > 0:
+                    for _ in range(count):
+                        child, offset = read_string(bytes, offset)
+                        children.append(child)
+                response = children
+            elif header.type == -1:
+                err = int_struct.unpack_from(bytes, offset)[0]
+                offset += int_struct.size
+                response = EXCEPTIONS[err]()
+            else:
+                raise MarshallingError(
+                    "Unknown multiRead response type: %s" % (header.type,)
+                )
+            results.append(response)
+            header, offset = MultiHeader.deserialize(bytes, offset)
+
+        if len(results) != len(self.operations):
+            raise MarshallingError(
+                "multiRead response count (%s) does not match request "
+                "count (%s)" % (len(results), len(self.operations))
+            )
+        return results
 
 
 class Create2(namedtuple("Create2", "path data acl flags")):

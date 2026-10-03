@@ -212,6 +212,12 @@ class AuthFailedError(ZookeeperError):
     """Client authentication failed."""
 
 
+@_zookeeper_exception(-117)
+class UnimplementedApiError(ZookeeperError):
+    """Operation is unimplemented by the server (e.g. an opcode from a
+    newer Zookeeper version, such as multiRead on a pre-3.6 server)."""
+
+
 @_zookeeper_exception(-118)
 class SessionMovedError(ZookeeperError):
     """Session moved to another server, so operation is ignored."""

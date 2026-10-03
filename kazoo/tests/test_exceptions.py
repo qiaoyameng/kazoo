@@ -36,3 +36,10 @@ class ExceptionsTestCase(TestCase):
         exc = module.EXCEPTIONS[-101]()
         assert type(exc) is module.NoNodeError
         assert exc.args == ()
+
+    def test_unimplemented_api_error_code(self) -> None:
+        module = self._get()
+        # Zookeeper returns -117 for opcodes it doesn't implement
+        # (e.g. multiRead, opcode 22, on servers older than 3.6).
+        assert issubclass(module.UnimplementedApiError, module.ZookeeperError)
+        assert module.EXCEPTIONS[-117] is module.UnimplementedApiError
