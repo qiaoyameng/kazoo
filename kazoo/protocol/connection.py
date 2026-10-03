@@ -14,6 +14,7 @@ import time
 from typing import (
     Callable,
     ContextManager,
+    Iterable,
     Iterator,
     Literal,
     TypeVar,
@@ -89,6 +90,7 @@ CREATED_EVENT = 1
 DELETED_EVENT = 2
 CHANGED_EVENT = 3
 CHILD_EVENT = 4
+PERSISTENT_WATCH_REMOVED_EVENT = 7
 
 WATCH_XID = -1
 PING_XID = -2
@@ -453,14 +455,49 @@ class ConnectionHandler:
         self.logger.debug("Received EVENT: %s", watch)
 
         watchers: list[WatchFunc] = []
+        # De-duplicate callbacks by identity so that a callback matched
+        # by several watch registrations (e.g. a one-shot watch and a
+        # persistent watch) is invoked exactly once for the event.
+        seen: set[WatchFunc] = set()
 
-        if watch.type in (CREATED_EVENT, CHANGED_EVENT):
-            watchers.extend(client._data_watchers.pop(path, []))
-        elif watch.type == DELETED_EVENT:
-            watchers.extend(client._data_watchers.pop(path, []))
-            watchers.extend(client._child_watchers.pop(path, []))
-        elif watch.type == CHILD_EVENT:
-            watchers.extend(client._child_watchers.pop(path, []))
+        def _add_watchers(callbacks: Iterable[WatchFunc]) -> None:
+            for callback in callbacks:
+                if callback not in seen:
+                    seen.add(callback)
+                    watchers.append(callback)
+
+        if watch.type == PERSISTENT_WATCH_REMOVED_EVENT:
+            # A server-side persistent watch was removed. Only the
+            # callbacks bound to that exact persistent registration are
+            # notified; one-shot watches are unrelated to this signal.
+            # The local registration is dropped before dispatch.
+            removed = [
+                callback
+                for reg in client._persistent_watchers.discard_path(path)
+                for callback in reg.callbacks
+            ]
+            _add_watchers(removed)
+        elif watch.type in (
+            CREATED_EVENT,
+            CHANGED_EVENT,
+            DELETED_EVENT,
+            CHILD_EVENT,
+        ):
+            if watch.type in (CREATED_EVENT, CHANGED_EVENT):
+                _add_watchers(client._data_watchers.pop(path, []))
+            elif watch.type == DELETED_EVENT:
+                _add_watchers(client._data_watchers.pop(path, []))
+                _add_watchers(client._child_watchers.pop(path, []))
+            elif watch.type == CHILD_EVENT:
+                _add_watchers(client._child_watchers.pop(path, []))
+
+            # Persistent registries are keyed by server-side paths, so
+            # matching happens before the chroot is stripped; callbacks
+            # still receive the unchrooted event further below.
+            server_event = WatchedEvent(
+                EVENT_TYPE_MAP[watch.type], client._state, path
+            )
+            _add_watchers(client._persistent_watchers.fire(server_event))
         else:
             self.logger.warn("Received unknown event %r", watch.type)
             return
@@ -924,6 +961,14 @@ class ConnectionHandler:
             zxid = self._invoke(connect_timeout / 1000.0, ap, xid=AUTH_XID)
             if zxid:
                 client.last_zxid = zxid
+
+        # Re-establish the persistent watches. This is needed after a
+        # transient connection loss (the new server does not know about
+        # watches held by the previous connection) and after a genuine
+        # session expiration (all server-side watch state was lost).
+        # One-shot watches are intentionally left to their owners and
+        # keep their previous semantics.
+        client._register_persistent_watches()
 
         return read_timeout, connect_timeout
 

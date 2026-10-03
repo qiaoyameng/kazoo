@@ -538,6 +538,62 @@ class SASL(namedtuple("SASL", "challenge")):
         return challenge, offset
 
 
+class AddWatch(namedtuple("AddWatch", "path mode")):
+    """Persistent (optionally recursive) watch registration request.
+
+    Introduced by ZooKeeper 3.6.0. Unlike the one-shot watch flag on
+    :class:`Exists`, :class:`GetData` and :class:`GetChildren`, an
+    AddWatch request registers a watcher that stays registered until it
+    is explicitly removed via :class:`RemoveWatches`.
+
+    ``mode`` carries the WatcherType wire code (4 for PERSISTENT, 5 for
+    PERSISTENT_RECURSIVE).
+    """
+
+    path: str
+    mode: int
+
+    type: ClassVar[int] = 23
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(int_struct.pack(self.mode))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes: bytes, offset: int) -> bool:
+        # AddWatchResponse is an empty struct.
+        return True
+
+
+class RemoveWatches(namedtuple("RemoveWatches", "path watcher_type")):
+    """Removal request for a watch registered on a path.
+
+    ``watcher_type`` is the WatcherType wire code:
+
+    * 1/2/3 remove a one-shot Children/Data/Any watch respectively.
+    * 4 removes a persistent watch.
+    * 5 removes a persistent-recursive watch.
+    """
+
+    path: str
+    watcher_type: int
+
+    type: ClassVar[int] = 18
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(int_struct.pack(self.watcher_type))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes: bytes, offset: int) -> bool:
+        # RemoveWatchesResponse is an empty struct.
+        return True
+
+
 class Watch(namedtuple("Watch", "type state path")):
     type: int
     state: int

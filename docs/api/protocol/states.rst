@@ -14,6 +14,8 @@ Public API
 
     .. autoclass:: KeeperState
 
+    .. autoclass:: AddWatchMode
+
     .. autoclass:: WatchedEvent
 
     .. autoclass:: ZnodeStat

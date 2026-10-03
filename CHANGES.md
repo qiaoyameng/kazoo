@@ -1,6 +1,19 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Features
+
+* **client:**
+  * add ZooKeeper 3.6+ persistent and persistent-recursive watches via
+    `KazooClient.add_watch` / `add_watch_async` and
+    `KazooClient.remove_watch` / `remove_watch_async` with the new
+    `~kazoo.protocol.states.AddWatchMode`. The watches are registered
+    with the `addWatch` (opcode 23) and `removeWatches` (opcode 18)
+    wire requests, survive transient disconnects, are re-registered
+    after a real session expiration, and are matched on whole path
+    segments so `/app` does not match `/apple`. A callback matched by
+    several registrations is invoked exactly once per event.
+
 #### Bug Fixes
 
 * **protocol:**
@@ -930,4 +943,3 @@ and/or the C binding.
     under the name 'Zookeeper'.
 -   Base client library with handler support for threading and gevent
     async environments.
-

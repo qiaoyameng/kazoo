@@ -106,12 +106,20 @@ class EventType(str, Enum):
 
         The connection state has been altered.
 
+    .. attribute:: PERSISTENT_WATCH_REMOVED
+
+        A persistent watch has been removed from the server, either
+        because the client explicitly asked for it to be removed or
+        because the watch was force-removed by the server. The event is
+        delivered to persistent and persistent-recursive watchers only.
+
     """
 
     CREATED = "CREATED"
     DELETED = "DELETED"
     CHANGED = "CHANGED"
     CHILD = "CHILD"
+    PERSISTENT_WATCH_REMOVED = "PERSISTENT_WATCH_REMOVED"
     NONE = "NONE"
 
 
@@ -121,7 +129,73 @@ EVENT_TYPE_MAP = {
     2: EventType.DELETED,
     3: EventType.CHANGED,
     4: EventType.CHILD,
+    7: EventType.PERSISTENT_WATCH_REMOVED,
 }
+
+
+# This is a (str, Enum) for backwards compatibility.
+class AddWatchMode(str, Enum):
+    """Persistent watch registration mode.
+
+    Used with :meth:`~kazoo.client.KazooClient.add_watch` to select
+    between a persistent watch that watches a single path and a
+    persistent-recursive watch that also covers the whole subtree
+    beneath it.
+
+    The values are the ones sent on the wire by ZooKeeper and match the
+    ``AddWatchMode``/``WatcherType`` enums of the server protocol.
+
+    .. attribute:: PERSISTENT
+
+        Watch a single path. The watch stays registered until it is
+        explicitly removed, even after it has been triggered.
+
+    .. attribute:: PERSISTENT_RECURSIVE
+
+        Watch a path and every znode beneath it, with the same
+        persistent semantics as :attr:`PERSISTENT`.
+
+    """
+
+    PERSISTENT = "PERSISTENT"
+    PERSISTENT_RECURSIVE = "PERSISTENT_RECURSIVE"
+
+    @property
+    def code(self) -> int:
+        """The integer WatcherType code sent in the AddWatch request."""
+        return _ADD_WATCH_CODES[self]
+
+    @classmethod
+    def from_code(cls, code: int) -> AddWatchMode:
+        """Return the mode matching an AddWatch/WatcherType wire code."""
+        for mode, mode_code in _ADD_WATCH_CODES.items():
+            if mode_code == code:
+                return mode
+        raise ValueError("Unknown persistent watch mode: %r" % (code,))
+
+
+# WatcherType codes used in the AddWatch wire protocol.
+_ADD_WATCH_CODES = {
+    AddWatchMode.PERSISTENT: 4,
+    AddWatchMode.PERSISTENT_RECURSIVE: 5,
+}
+
+
+def watch_path_matches(watch_path: str, event_path: str | None) -> bool:
+    """Return whether an event path is covered by a persistent-recursive
+    watch registered at ``watch_path``.
+
+    Matching is performed on whole path segments so that a watch on
+    ``/app`` matches ``/app`` and ``/app/sub/node`` but never
+    ``/apple``.
+    """
+    if event_path is None:
+        return False
+    if watch_path == "/":
+        return event_path.startswith("/")
+    return event_path == watch_path or event_path.startswith(
+        watch_path + "/"
+    )
 
 
 class WatchedEvent(NamedTuple):

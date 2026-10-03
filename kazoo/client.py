@@ -32,6 +32,7 @@ from kazoo.exceptions import (
     ConnectionLoss,
     KazooException,
     NoNodeError,
+    NoWatcherError,
     NodeExistsError,
     SessionExpiredError,
     WriterNotClosedException,
@@ -41,8 +42,10 @@ from kazoo.handlers.utils import capture_exceptions, wrap
 from kazoo.hosts import collect_hosts
 from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.connection import ConnectionHandler
+from kazoo.protocol.persistent import PersistentWatchManager
 from kazoo.protocol.paths import _prefix_root, normpath
 from kazoo.protocol.serialization import (
+    AddWatch,
     Auth,
     CheckVersion,
     CloseInstance,
@@ -56,11 +59,13 @@ from kazoo.protocol.serialization import (
     SetACL,
     GetData,
     Reconfig,
+    RemoveWatches,
     SetData,
     Sync,
     Transaction,
 )
 from kazoo.protocol.states import (
+    AddWatchMode,
     Callback,
     EventType,
     KazooState,
@@ -375,6 +380,7 @@ class KazooClient:
         self._data_watchers: defaultdict[str, Set[WatchFunc]] = defaultdict(
             set
         )
+        self._persistent_watchers = PersistentWatchManager()
         self._reset()
         self.read_only = read_only
 
@@ -728,6 +734,12 @@ class KazooClient:
             self._live.clear()
             self._make_state_change(KazooState.LOST)
             self._notify_pending(state)
+            # A session expiration is recoverable: the connection
+            # handler will establish a new session and re-register the
+            # persistent watches. An explicit stop and an auth failure
+            # are terminal for this client, so drop the registrations.
+            if state in (KeeperState.CLOSED, KeeperState.AUTH_FAILED):
+                self._persistent_watchers.clear()
             self._reset()
         else:
             self.logger.info("Zookeeper connection lost")
@@ -1586,6 +1598,214 @@ class KazooClient:
             req = GetChildren(_prefix_root(self.chroot, path), watch)
         self._call(req, async_result)
         return async_result
+
+    def add_watch(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: AddWatchMode = AddWatchMode.PERSISTENT,
+    ) -> bool:
+        """Add a persistent watch on a path.
+
+        Persistent watches (ZooKeeper 3.6+) are not consumed by the
+        first event they trigger: they keep firing until they are
+        removed with :meth:`remove_watch` or the client is stopped.
+
+        With :attr:`~kazoo.protocol.states.AddWatchMode.PERSISTENT`
+        only events for the given path are delivered. With
+        :attr:`~kazoo.protocol.states.AddWatchMode.PERSISTENT_RECURSIVE`
+        events for the path and every znode beneath it are delivered
+        too. Matching is done on full path segments, so a recursive
+        watch on ``/app`` matches ``/app/sub`` but not ``/apple``.
+
+        Unlike the one-shot ``watch`` parameter of :meth:`get`,
+        :meth:`exists` and :meth:`get_children`, the registered node
+        does not have to exist.
+
+        Multiple callbacks registered for the same ``(path, mode)``
+        share a single server-side watch. If the same callback is
+        registered several times through overlapping watches it is
+        still invoked exactly once per event.
+
+        :param path: Path of node.
+        :param watch: Watch callback to invoke for matching events.
+        :param mode: Persistent watch mode.
+        :returns: ``True`` if a new server watch was registered,
+                  ``False`` if the callback joined an existing watch.
+        :rtype: bool
+
+        :raises:
+            :exc:`~kazoo.exceptions.KazooException` if the watch cannot
+            be registered with the server.
+        """
+        return cast("bool", self.add_watch_async(path, watch, mode).get())
+
+    def add_watch_async(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: AddWatchMode = AddWatchMode.PERSISTENT,
+    ) -> IAsyncResult:
+        """Asynchronously add a persistent watch. Takes the same
+        arguments as :meth:`add_watch`.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        if not callable(watch):
+            raise TypeError("Invalid type for 'watch' (must be a callable)")
+        if not isinstance(mode, AddWatchMode):
+            raise TypeError(
+                "Invalid type for 'mode' (AddWatchMode expected)"
+            )
+
+        server_path = _prefix_root(self.chroot, path)
+        async_result = self.handler.async_result()
+        register_result = self.handler.async_result()
+
+        @capture_exceptions(async_result)
+        def completion(result: IAsyncResult) -> None:
+            result.get()
+            async_result.set(True)
+
+        # Hold the manager lock while updating the registry and
+        # enqueuing the wire request so the ordering against a
+        # concurrent re-registration pass cannot be observed out of line.
+        with self._persistent_watchers.lock:
+            needs_request = self._persistent_watchers.add(
+                server_path, mode, watch
+            )
+            if not needs_request:
+                async_result.set(False)
+                return async_result
+            queued = self._call(
+                AddWatch(server_path, mode.code), register_result
+            )
+            if queued is False:
+                # Terminal state: nothing will reconnect, so don't leave
+                # a dangling local registration behind.
+                self._persistent_watchers.remove(
+                    server_path, mode, watch
+                )
+                return async_result
+
+        register_result.rawlink(completion)
+        return async_result
+
+    def remove_watch(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: AddWatchMode = AddWatchMode.PERSISTENT,
+    ) -> bool:
+        """Remove a callback previously added with :meth:`add_watch`.
+
+        The server-side watch is only removed once the last callback
+        registered for the ``(path, mode)`` pair goes away. Removing a
+        callback that is not registered is a no-op.
+
+        A watch removed while the connection is suspended or being
+        re-established is never re-registered when the connection comes
+        back, even if re-registration requests are still queued.
+
+        :returns: ``True`` when a RemoveWatches request was sent,
+                  ``False`` when the callback was already gone locally.
+        :rtype: bool
+
+        """
+        return cast(
+            "bool", self.remove_watch_async(path, watch, mode).get()
+        )
+
+    def remove_watch_async(
+        self,
+        path: str,
+        watch: WatchFunc,
+        mode: AddWatchMode = AddWatchMode.PERSISTENT,
+    ) -> IAsyncResult:
+        """Asynchronously remove a persistent watch. Takes the same
+        arguments as :meth:`remove_watch`.
+
+        :rtype: :class:`~kazoo.interfaces.IAsyncResult`
+
+        """
+        if not isinstance(path, str):
+            raise TypeError("Invalid type for 'path' (string expected)")
+        if not callable(watch):
+            raise TypeError("Invalid type for 'watch' (must be a callable)")
+        if not isinstance(mode, AddWatchMode):
+            raise TypeError(
+                "Invalid type for 'mode' (AddWatchMode expected)"
+            )
+
+        server_path = _prefix_root(self.chroot, path)
+        async_result = self.handler.async_result()
+        remove_result = self.handler.async_result()
+
+        @capture_exceptions(async_result)
+        def completion(result: IAsyncResult) -> None:
+            try:
+                result.get()
+            except NoWatcherError:
+                # The server no longer holds the watch. Either way the
+                # desired end state holds.
+                async_result.set(False)
+            else:
+                async_result.set(True)
+
+        # Local state is updated and never rolled back; enqueuing under
+        # the manager lock means a removal cannot be reordered past a
+        # concurrent re-registration pass, so a removed watch can never
+        # be resurrected.
+        with self._persistent_watchers.lock:
+            needs_request = self._persistent_watchers.remove(
+                server_path, mode, watch
+            )
+            if not needs_request:
+                async_result.set(False)
+                return async_result
+            self._call(
+                RemoveWatches(server_path, mode.code), remove_result
+            )
+
+        remove_result.rawlink(completion)
+        return async_result
+
+    def _register_persistent_watches(self) -> None:
+        """(Re-)register every locally known persistent watch.
+
+        Called by the connection handler once a connection has been
+        established. This is needed both after a transient connection
+        loss (the watches live on the old server but a new server needs
+        to learn about them) and after a genuine session expiration,
+        where all server-side state was lost. Snapshotting the
+        registries under the manager lock ensures a watch removed
+        concurrently by the user is not re-added.
+        """
+        with self._persistent_watchers.lock:
+            registrations = self._persistent_watchers.registrations()
+            requests = [
+                AddWatch(reg.path, reg.mode.code) for reg in registrations
+            ]
+
+        for request in requests:
+            async_result = self.handler.async_result()
+            self._call(request, async_result)
+
+            def _swallow(
+                result: IAsyncResult, request: object = request
+            ) -> None:
+                try:
+                    result.get()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to re-register persistent watch %r",
+                        request,
+                    )
+
+            async_result.rawlink(_swallow)
 
     def get_acls(self, path: str) -> tuple[list[ACL], ZnodeStat]:
         """Return the ACL and stat of the node of the given path.
