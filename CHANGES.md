@@ -1,6 +1,13 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Features
+
+* **client:**
+  * add `multi_read` support for Zookeeper 3.6+, batching `get_data` and
+    `get_children` operations into a single request with per-operation
+    results kept in input order
+
 #### Bug Fixes
 
 * **protocol:**
@@ -930,4 +937,3 @@ and/or the C binding.
     under the name 'Zookeeper'.
 -   Base client library with handler support for threading and gevent
     async environments.
-

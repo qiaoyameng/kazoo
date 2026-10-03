@@ -54,3 +54,7 @@ Public API
     .. autoclass:: TransactionRequest
         :members:
         :member-order: bysource
+
+    .. autoclass:: MultiReadRequest
+        :members:
+        :member-order: bysource

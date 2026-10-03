@@ -449,6 +449,70 @@ class Transaction(namedtuple("Transaction", "operations")):
         return resp
 
 
+MultiRead_Types = Union[GetData, GetChildren]
+MultiRead_Response = Union[
+    tuple[bytes | None, ZnodeStat], list[str], ZookeeperError
+]
+
+
+class MultiRead(namedtuple("MultiRead", "operations")):
+    """A Zookeeper 3.6+ multiRead request.
+
+    Batches :class:`GetData` and :class:`GetChildren` operations into a
+    single request. Unlike :class:`Transaction` this is a read-only
+    batch, not a write transaction.
+    """
+
+    operations: list[MultiRead_Types]
+
+    type: ClassVar[int] = 22
+
+    def serialize(self) -> bytearray:
+        b = bytearray()
+        for op in self.operations:
+            b.extend(
+                MultiHeader(op.type, False, -1).serialize() + op.serialize()
+            )
+        return b + multiheader_struct.pack(-1, True, -1)
+
+    def deserialize(
+        self, bytes: bytes, offset: int
+    ) -> list[MultiRead_Response]:
+        results: list[MultiRead_Response] = []
+        while True:
+            header, offset = MultiHeader.deserialize(bytes, offset)
+            if header.done:
+                break
+            if header.type == GetData.type:
+                data, offset = read_buffer(bytes, offset)
+                stat = ZnodeStat(*stat_struct.unpack_from(bytes, offset))
+                offset += stat_struct.size
+                results.append((data, stat))
+            elif header.type == GetChildren.type:
+                count = int_struct.unpack_from(bytes, offset)[0]
+                offset += int_struct.size
+                children = []
+                for c in range(count):
+                    child, offset = read_string(bytes, offset)
+                    children.append(child)
+                results.append(children)
+            elif header.type == -1:
+                err = int_struct.unpack_from(bytes, offset)[0]
+                offset += int_struct.size
+                results.append(EXCEPTIONS[err]())
+            else:
+                raise ValueError(
+                    "Unknown operation type %r in multiRead response"
+                    % (header.type,)
+                )
+        if len(results) != len(self.operations):
+            raise ValueError(
+                "multiRead response contained %d results for %d operations"
+                % (len(results), len(self.operations))
+            )
+        return results
+
+
 class Create2(namedtuple("Create2", "path data acl flags")):
     path: str
     data: bytes | None
