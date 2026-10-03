@@ -24,6 +24,7 @@ organized alphabetically by module name.
    api/recipe/partitioner
    api/recipe/party
    api/recipe/queue
+   api/recipe/snapshot
    api/recipe/watchers
    api/retry
    api/security

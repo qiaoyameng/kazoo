@@ -54,6 +54,31 @@ class SASLException(KazooException):
     """
 
 
+class TreeSnapshotError(KazooException):
+    """Base class for failures of consistent tree snapshot reads.
+
+    .. versionadded:: 2.12.0
+    """
+
+
+class SnapshotUnstableError(TreeSnapshotError):
+    """The subtree kept changing while being read.
+
+    Raised when no read attempt within the retry limit could be
+    verified as stable, so no consistent snapshot could be produced.
+
+    .. versionadded:: 2.12.0
+    """
+
+
+class TreeTooLargeError(TreeSnapshotError):
+    """The subtree exceeded the configured node limit during a
+    snapshot read.
+
+    .. versionadded:: 2.12.0
+    """
+
+
 def _invalid_error_code() -> Type[ZookeeperError]:
     raise RuntimeError("Invalid error code")
 

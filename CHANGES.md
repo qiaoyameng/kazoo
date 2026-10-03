@@ -1,6 +1,13 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Features
+
+* **recipe:**
+  * add `kazoo.recipe.snapshot.get_tree_snapshot`, a subtree read that verifies a
+    common stable interval via ZooKeeper version fields (`czxid`, `mzxid`/`version`,
+    `cversion`/`pzxid`, `aversion`) with bounded retries and a node limit
+
 #### Bug Fixes
 
 * **protocol:**
@@ -930,4 +937,3 @@ and/or the C binding.
     under the name 'Zookeeper'.
 -   Base client library with handler support for threading and gevent
     async environments.
-

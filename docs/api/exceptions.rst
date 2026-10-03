@@ -30,6 +30,12 @@ Public API
 
 .. autoexception:: NotEmptyError
 
+.. autoexception:: SnapshotUnstableError
+
+.. autoexception:: TreeSnapshotError
+
+.. autoexception:: TreeTooLargeError
+
 Private API
 +++++++++++
 
