@@ -17,3 +17,8 @@ Public API
         :members:
 
         .. automethod:: __init__
+
+    .. autoclass:: ReusableDoubleBarrier
+        :members:
+
+        .. automethod:: __init__

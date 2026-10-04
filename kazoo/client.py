@@ -71,7 +71,7 @@ from kazoo.retry import KazooRetry
 from kazoo.security import ACL, OPEN_ACL_UNSAFE
 
 # convenience API
-from kazoo.recipe.barrier import Barrier, DoubleBarrier
+from kazoo.recipe.barrier import Barrier, DoubleBarrier, ReusableDoubleBarrier
 from kazoo.recipe.counter import Counter
 from kazoo.recipe.election import Election
 from kazoo.recipe.lease import NonBlockingLease, MultiNonBlockingLease
@@ -527,6 +527,7 @@ class KazooClient:
         self.Barrier = partial(Barrier, self)
         self.Counter = partial(Counter, self)
         self.DoubleBarrier = partial(DoubleBarrier, self)
+        self.ReusableDoubleBarrier = partial(ReusableDoubleBarrier, self)
         self.ChildrenWatch = partial(ChildrenWatch, self)
         self.DataWatch = partial(DataWatch, self)
         self.Election = partial(Election, self)

@@ -1,6 +1,11 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Features
+
+* **recipe:**
+  * add `ReusableDoubleBarrier`, a double barrier that binds every participation to an explicit round so the same group of workers can safely reuse it across rounds
+
 #### Bug Fixes
 
 * **protocol:**
@@ -930,4 +935,3 @@ and/or the C binding.
     under the name 'Zookeeper'.
 -   Base client library with handler support for threading and gevent
     async environments.
-
